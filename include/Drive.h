@@ -56,9 +56,9 @@ class Drive{
         float bias = 0.f;
 
         float Kp = 0.0001f; 
-        float Kc = 12.0f;  // heading gain constant
+        float Kc = 0.5f; //12.0f;  // heading gain constant
         float Ky = 0.30f;   // lateral gain constant
-        float Kcd = 6.0f;  // lateral derivative gain constant
+        float Kcd = 0.0f; //6.0f // lateral derivative gain constant
         float lastHeadingError = 0.f;
         float speed_reference = 515.f; // reference speed for straight drive
 

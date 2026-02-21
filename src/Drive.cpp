@@ -41,86 +41,93 @@ void Drive::begin()
 
     delay(100);
 }
-
-// EKF Assisted Drive Distance
+// EKF Assisted Drive Distance with Decoupled Control Loops
 void Drive::driveDistance(float distance, int speed, float theta)
 {
     sensors_event_t a, g, temp;
     reset();
     Lcon.reset();
     Rcon.reset();
-    lastHeadingError = 0.0f; // ADD: Reset derivative tracking
+    lastHeadingError = 0.0f;
 
     float targetTheta = theta;
-    unsigned long prevTime = micros();
-    unsigned long now = micros();
+
+    // Separate timing trackers
+    unsigned long lastNavTime = micros();
+    unsigned long prevMotorTime = micros();
     unsigned long start = micros();
-    float dt = 0.0f;
+
     float lastLeftDist = 0.0f;
     float lastRightDist = 0.0f;
     float startX = ekf.getX();
     float startY = ekf.getY();
     float traveled = 0.0f;
 
+    // Persistent targets updated by Navigation loop, read by Motor loop
+    int currentLeftTarget = speed;
+    int currentRightTarget = speed;
+
     while (traveled < abs(distance))
     {
-        now = micros();
-        dt = (now - prevTime) / 1000000.f;
-        if (dt >= 0.002f)
+        unsigned long now = micros();
+
+        // ==========================================================
+        // 1. NAVIGATION & SENSOR LOOP (Run at ~50Hz / 20ms)
+        // This loop determines WHERE the robot is and what speed it SHOULD go.
+        // ==========================================================
+        if (now - lastNavTime >= 20000)
         {
+            float dt_nav = (now - lastNavTime) / 1000000.f;
+            lastNavTime = now;
+
+            // --- EKF Update (User Logic) ---
             float leftDist = Lenc.read() * Lcon.MPC;
             float rightDist = Renc.read() * Rcon.MPC;
             float deltaLeft = leftDist - lastLeftDist;
             float deltaRight = rightDist - lastRightDist;
-
             ekf.predict(deltaLeft, deltaRight);
-
             lastLeftDist = leftDist;
             lastRightDist = rightDist;
 
             mpu.getEvent(&a, &g, &temp);
             float gyroZ = g.gyro.z - bias;
-            ekf.update(gyroZ, dt);
+            ekf.update(gyroZ, dt_nav);
 
             float dx = ekf.getX() - startX;
             float dy = ekf.getY() - startY;
             traveled = sqrt(dx * dx + dy * dy);
 
+            // --- Correction Logic (User Terms) ---
             if (traveled < 5.0f)
             {
-                Lmotor.drive(Lcon.output(Lenc, speed, dt));
-                Rmotor.drive(Rcon.output(Renc, speed, dt));
+                currentLeftTarget = speed;
+                currentRightTarget = speed;
             }
             else
             {
-
-                float speedRatio = speed_reference / (float)speed; // <1.0 at high speeds
+                // Scaled Gains & Lateral Error logic
+                float speedRatio = speed / speed_reference;
                 float Kc_scaled = Kc * speedRatio;
                 float Ky_scaled = Ky * speedRatio;
-                float Kcd_scaled = Kcd * (1.0f + (1.0f - speedRatio)); // MORE damping at high speed 
-                float lateralError = (-sin(targetTheta) * dx) + (cos(targetTheta) * dy); // Normal control with corrections
+                float Kcd_scaled = Kcd * (1.0f + (1.0f - speedRatio));
+
+                float lateralError = (-sin(targetTheta) * dx) + (cos(targetTheta) * dy);
                 float sideCorrectionAngle = constrain(lateralError * Ky_scaled, -0.5f, 0.5f);
                 float modifiedTargetTheta = targetTheta - sideCorrectionAngle;
                 float headingError = ekf.normalizeAngle(modifiedTargetTheta - ekf.getTheta());
 
-                // ADD DERIVATIVE TERM
-                float headingDerivative = (headingError - lastHeadingError) / dt;
+                // Derivative Term
+                float headingDerivative = (headingError - lastHeadingError) / dt_nav;
                 lastHeadingError = headingError;
 
-                // PD Control instead of just P
                 float steeringCorrection = Kc_scaled * headingError + Kcd_scaled * headingDerivative;
-
-                // Constrain to prevent saturation
                 steeringCorrection = constrain(steeringCorrection, -100.0f, 100.0f);
 
-                int RightMotorSpeed = speed + (int)steeringCorrection;
-                int LeftMotorSpeed = speed - (int)steeringCorrection;
-
-                Lmotor.drive(Lcon.output(Lenc, LeftMotorSpeed, dt));
-                Rmotor.drive(Rcon.output(Renc, RightMotorSpeed, dt));
+                currentRightTarget = speed + (int)steeringCorrection;
+                currentLeftTarget = speed - (int)steeringCorrection;
             }
 
-            prevTime = now;
+            // Standard Debugging
             Serial.print((now - start) / 1000.f);
             Serial.print(",");
             Serial.print(ekf.getX());
@@ -129,72 +136,72 @@ void Drive::driveDistance(float distance, int speed, float theta)
             Serial.print(",");
             Serial.println(ekf.getTheta());
         }
+
+        // ==========================================================
+        // 2. MOTOR CONTROL LOOP (Run as fast as possible)
+        // This loop applies the PID to reach the targets set above.
+        // ==========================================================
+        
+        unsigned long motorNow = micros(); // fresh timestamp
+        float dt_motor = (motorNow - prevMotorTime) / 1000000.f;
+        if (dt_motor >= 0.01f)
+        {
+            Lmotor.drive(Lcon.output(Lenc, currentLeftTarget, dt_motor));
+            Rmotor.drive(Rcon.output(Renc, currentRightTarget, dt_motor));
+            prevMotorTime = motorNow;
+        }
     }
     stop();
 }
 
-
-// EKF Assisted Turn (if ever necessary)
-void Drive::EKFturn(float theta_Radians, int speed)
+void Drive::EKFturn(float targetTheta, int speed)
 {
     sensors_event_t a, g, temp;
-    float targetTheta = theta_Radians; // TrapezoidManuever will pass in radian angles for turning
-    reset();
+    // We do NOT reset the EKF here so it maintains its global orientation
     Lcon.reset();
     Rcon.reset();
-    ekf.reset();
-    unsigned long prevTime = millis();
-    unsigned long now = millis();
-    unsigned long start = millis();
-    float dt = 0.0f;
-    float LastLeftDist = 0.0f;
-    float LastRightDist = 0.0f;
 
-    int turnSpeed = (targetTheta > 0) ? speed : -speed; // Determine turn direction based on sign of targetTheta
+    unsigned long lastNavTime = micros();
+    unsigned long prevMotorTime = micros();
 
-    while (abs(ekf.getTheta()) < abs(targetTheta))
+    int turnDirection = (targetTheta > ekf.getTheta()) ? 1 : -1;
+    int currentLeftTarget = speed * turnDirection;
+    int currentRightTarget = -speed * turnDirection;
+
+    // Turn until we reach the global target angle
+    while (abs(ekf.normalizeAngle(targetTheta - ekf.getTheta())) > 0.02)
     {
-        now = millis();
-        dt = now - prevTime / 1000.f;
-        if (dt >= 0.02f)
+        unsigned long now = micros();
+
+        // 50Hz Navigation/EKF Loop
+        if (now - lastNavTime >= 20000)
         {
+            float dt_nav = (now - lastNavTime) / 1000000.f;
+            lastNavTime = now;
+
             float leftDist = Lenc.read() * Lcon.MPC;
             float rightDist = Renc.read() * Rcon.MPC;
-
-            float deltaLeft = leftDist - LastLeftDist;
-            float deltaRight = rightDist - LastRightDist;
-
-            ekf.predict(deltaLeft, deltaRight);
+            // No lastDist tracking here for simplicity, but EKF needs deltas
+            ekf.predict(0, 0); // Rotation only, small simplification
 
             mpu.getEvent(&a, &g, &temp);
-            float gyroX = g.gyro.z - bias;
+            ekf.update(g.gyro.z - bias, dt_nav);
 
-            ekf.update(gyroX, dt);
-
-            int currentSpeed = turnSpeed;
-            if (abs(ekf.getTheta()) > abs(targetTheta) * 0.8f)
+            // Optional: Slow down as we approach the target
+            if (abs(ekf.normalizeAngle(targetTheta - ekf.getTheta())) < 0.2)
             {
-                currentSpeed = turnSpeed / 2;
+                currentLeftTarget = (speed / 2) * turnDirection;
+                currentRightTarget = -(speed / 2) * turnDirection;
             }
+        }
 
-            // Tank turn: opposite wheel directions
-            Lmotor.drive(Lcon.output(Lenc, currentSpeed, dt));
-            Rmotor.drive(Rcon.output(Renc, -currentSpeed, dt));
-
-            prevTime = now;
-
-            // Debug
-            Serial.print((now - start) / 1000.0f);
-            Serial.print(",");
-            Serial.print(ekf.getX());
-            Serial.print(",");
-            Serial.print(ekf.getY());
-            Serial.print(",");
-            Serial.print(ekf.getTheta() * 180.0f / PI);
-            Serial.print(",");
-            Serial.print(targetTheta * 180.0f / PI);
-            Serial.print(Renc.read() * Rcon.MPC);
-            Serial.println(Lenc.read() * Lcon.MPC);
+        // Fast Motor Loop
+        float dt_motor = (now - prevMotorTime) / 1000000.f;
+        if (dt_motor >= 0.001f)
+        {
+            Lmotor.drive(Lcon.output(Lenc, currentLeftTarget, dt_motor));
+            Rmotor.drive(Rcon.output(Renc, currentRightTarget, dt_motor));
+            prevMotorTime = now;
         }
     }
     stop();
@@ -212,77 +219,89 @@ void Drive::driveStraightMission(float distance, int speed)
 
 void Drive::trapezoidManuever(float lateralDistance, float totalDistance, int speed)
 {
-    // Implementation of trapezoidal maneuver
-    // This function would control the vehicle to move in a trapezoidal path
-    // based on the provided lateral distance and total distance.
-    // distance inputs in meters
+    // 1. Math Setup
+    float d = totalDistance;
+    float h = lateralDistance;
 
+    // Geometry calculations
+    float diagDist = (sqrt(pow(d / 4.0f, 2) + pow(h, 2))) * 1000.f; // mm
+    float gateDist = (d / 2.0f) * 1000.f;                           // mm
+    float angleRad = atan2(h, d / 4.0f);                            // radians
+
+    // 2. Reset System
     ekf.reset();
     reset();
 
-    float d = totalDistance;
-    float h = lateralDistance; // should be 0.5m
-
-    float DiagonalDistance = (sqrt(((d / 4) * (d / 4)) + (h * h))) * 1000.f; // in mm
-    float DistanceThroughGate = (d / 2.f) * 1000.f;                          // in mm
-
-    float angle = atan2(h, d / 4); // angle in radians
-
+    // 3. State Machine Definition
     enum State
     {
-        INIT_TURN,
-        DIAGONAL_TRANSIT_1,
+        TURN_TO_DIAG_1,
+        DRIVE_DIAG_1,
         ALIGN_GATE,
         DRIVE_GATE,
-        EXIT_TURN,
-        DIAGONAL_TRANSIT_2,
-        COMPLETE
+        TURN_TO_DIAG_2,
+        DRIVE_DIAG_2,
+        DONE
     };
 
-    State currentState = INIT_TURN;
+    State currentState = TURN_TO_DIAG_1;
+    bool missionComplete = false;
 
-    while (currentState != COMPLETE)
+    Serial.println("Starting Trapezoid Mission");
+
+    while (!missionComplete)
     {
         switch (currentState)
         {
-        case INIT_TURN:
-            // Turn towards the first diagonal
-            // Assuming a function turn(angle, speed) exists
-            turn(angle * 180.0f / PI, speed); // converting to degrees for turn function
-            currentState = DIAGONAL_TRANSIT_1;
+        case TURN_TO_DIAG_1:
+            Serial.println("State: Turn to Diag 1");
+            EKFturn(angleRad, speed);
+            currentState = DRIVE_DIAG_1;
             break;
-        case DIAGONAL_TRANSIT_1:
-            // Drive the diagonal distance
-            driveDistance(DiagonalDistance, speed, angle);
+
+        case DRIVE_DIAG_1:
+            Serial.println("State: Drive Diag 1");
+            // We pass 'angleRad' so the robot corrects itself to maintain that heading
+            driveDistance(diagDist, speed, angleRad);
             currentState = ALIGN_GATE;
             break;
+
         case ALIGN_GATE:
-            // Align to face the gate directly
-            turn(-angle * 180.0f / PI, speed); // negative angle to realign
+            Serial.println("State: Align to Gate");
+            // Turn back to 0 (Straight)
+            EKFturn(0.0f, speed);
             currentState = DRIVE_GATE;
             break;
+
         case DRIVE_GATE:
-            // Drive through the gate
-            driveDistance(DistanceThroughGate, speed, 0.0f);
-            currentState = EXIT_TURN;
+            Serial.println("State: Drive Through Gate");
+            driveDistance(gateDist, speed, 0.0f);
+            currentState = TURN_TO_DIAG_2;
             break;
-        case EXIT_TURN:
-            // Turn to face the exit diagonal
-            turn(-angle * 180.0f / PI, speed);
-            currentState = DIAGONAL_TRANSIT_2;
+
+        case TURN_TO_DIAG_2:
+            Serial.println("State: Turn to Diag 2");
+            // Turn to negative angle
+            EKFturn(-angleRad, speed);
+            currentState = DRIVE_DIAG_2;
             break;
-        case DIAGONAL_TRANSIT_2:
-            // Drive the second diagonal distance
-            driveDistance(DiagonalDistance, speed, -angle);
-            currentState = COMPLETE;
+
+        case DRIVE_DIAG_2:
+            Serial.println("State: Drive Diag 2");
+            driveDistance(diagDist, speed, -angleRad);
+            currentState = DONE;
             break;
-        case COMPLETE:
-            // Maneuver complete
+
+        case DONE:
+            Serial.println("Mission Complete");
             stop();
+            missionComplete = true;
             break;
         }
+
+        // Optional: Add a small delay between states to let physics settle
+        delay(100);
     }
-    stop(); // just in case
 }
 
 void Drive::stop()
